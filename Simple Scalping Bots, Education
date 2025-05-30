@@ -1,0 +1,165 @@
+import ccxt
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import time
+import threading
+
+# Parameters
+initial_capital = 10000  # Starting capital in USD
+short_window = 5   # Short-term SMA period (0.5 seconds at 100ms intervals)
+long_window = 20   # Long-term SMA period (2 seconds at 100ms intervals)
+position_size = 0.1  # Fraction of capital to use per trade
+update_interval = 0.1  # Fetch data every 100 milliseconds
+
+# Global data storage
+klines = []
+capital = initial_capital
+position = 0  # BTC held
+trades = []
+lock = threading.Lock()
+
+# Fetch recent BTC-USDT data
+def fetch_data(exchange):
+    start_time = time.time()
+    try:
+        ticker = exchange.fetch_ticker('BTC/USDT')
+        kline = [
+            int(ticker['timestamp']),
+            ticker['open'],
+            ticker['high'],
+            ticker['low'],
+            ticker['last'],
+            ticker['baseVolume']
+        ]
+        latency = (time.time() - start_time) * 1000  # Latency in milliseconds
+        volume_24h = ticker['baseVolume']  # 24-hour volume
+        with lock:
+            klines.append(kline)
+            if len(klines) > long_window + 1:
+                klines.pop(0)  # Keep only the latest data
+        return True, latency, volume_24h
+    except Exception as e:
+        latency = (time.time() - start_time) * 1000
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}: Fetch error: {e}")
+        return False, latency, 0
+
+# Calculate volatility (percentage change over long_window)
+def calculate_volatility(df):
+    if len(df) < long_window:
+        return 0
+    prices = df['close']
+    price_change = ((prices.iloc[-1] - prices.iloc[-long_window]) / prices.iloc[-long_window]) * 100
+    return abs(price_change)
+
+# Simulate trading for the latest kline
+def check_trading_signal(latency, volume_24h):
+    global capital, position, trades
+    with lock:
+        if len(klines) < long_window + 1:
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}: Waiting for data... (Latency: {latency:.2f}ms, Volume: {volume_24h:.2f} BTC)")
+            return
+        
+        # Convert klines to DataFrame
+        df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df['Short_SMA'] = df['close'].rolling(window=short_window).mean()
+        df['Long_SMA'] = df['close'].rolling(window=long_window).mean()
+        
+        i = -1  # Latest kline
+        if pd.notna(df['Short_SMA'].iloc[i]) and pd.notna(df['Long_SMA'].iloc[i]):
+            prev_short_sma = df['Short_SMA'].iloc[i-1].item()
+            prev_long_sma = df['Long_SMA'].iloc[i-1].item()
+            curr_short_sma = df['Short_SMA'].iloc[i].item()
+            curr_long_sma = df['Long_SMA'].iloc[i].item()
+            price = df['close'].iloc[i].item()
+            volatility = calculate_volatility(df)
+            market = "Bull" if curr_short_sma > curr_long_sma else "Bear"
+            
+            # Buy signal: Short SMA crosses above Long SMA
+            if curr_short_sma > curr_long_sma and prev_short_sma <= prev_long_sma and capital > 0:
+                btc_to_buy = (capital * position_size) / price
+                capital -= btc_to_buy * price
+                position += btc_to_buy
+                trades.append({
+                    'Date': df['timestamp'].iloc[i],
+                    'Type': 'BUY',
+                    'Price': price,
+                    'BTC': btc_to_buy,
+                    'Capital': capital,
+                    'Position': position,
+                    'Latency': latency,
+                    'Volume': volume_24h,
+                    'Volatility': volatility,
+                    'Market': market
+                })
+                print(f"{trades[-1]['Date'].strftime('%Y-%m-%d %H:%M:%S.%f')}: BUY {btc_to_buy:.6f} BTC at ${price:.2f}, "
+                      f"Capital: ${capital:.2f}, Position: {position:.6f} BTC, "
+                      f"Latency: {latency:.2f}ms, Volume: {volume_24h:.2f} BTC, Volatility: {volatility:.2f}%, Market: {market}")
+            
+            # Sell signal: Short SMA crosses below Long SMA
+            elif curr_short_sma < curr_long_sma and prev_short_sma >= prev_long_sma and position > 0:
+                capital += position * price
+                trades.append({
+                    'Date': df['timestamp'].iloc[i],
+                    'Type': 'SELL',
+                    'Price': price,
+                    'BTC': position,
+                    'Capital': capital,
+                    'Position': 0,
+                    'Latency': latency,
+                    'Volume': volume_24h,
+                    'Volatility': volatility,
+                    'Market': market
+                })
+                print(f"{trades[-1]['Date'].strftime('%Y-%m-%d %H:%M:%S.%f')}: SELL {position:.6f} BTC at ${price:.2f}, "
+                      f"Capital: ${capital:.2f}, Position: 0.000000 BTC, "
+                      f"Latency: {latency:.2f}ms, Volume: {volume_24h:.2f} BTC, Volatility: {volatility:.2f}%, Market: {market}")
+                position = 0
+            
+            # Print hold status
+            else:
+                final_value = capital + position * price
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}: HOLD, Portfolio Value: ${final_value:.2f}, "
+                      f"Capital: ${capital:.2f}, BTC: {position:.6f}, "
+                      f"Latency: {latency:.2f}ms, Volume: {volume_24h:.2f} BTC, Volatility: {volatility:.2f}%, Market: {market}")
+
+# Data fetching thread
+def data_fetcher(exchange):
+    while True:
+        try:
+            success, latency, volume_24h = fetch_data(exchange)
+            if success:
+                check_trading_signal(latency, volume_24h)
+            time.sleep(update_interval)
+        except Exception as e:
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}: Fetcher error: {e}")
+            time.sleep(update_interval)
+
+# Main function
+def main():
+    exchange = ccxt.binance({'enableRateLimit': True})
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}: Starting scalping bot with initial capital: ${initial_capital:.2f}")
+    
+    # Start data fetching in a separate thread
+    fetcher_thread = threading.Thread(target=data_fetcher, args=(exchange,), daemon=True)
+    fetcher_thread.start()
+    
+    try:
+        while True:
+            time.sleep(0.1)  # Keep main thread alive
+    except KeyboardInterrupt:
+        print(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}: Stopping bot...")
+        with lock:
+            final_value = capital + (position * klines[-1][4] if klines else 0)
+            print(f"Final Portfolio Value: ${final_value:.2f}, Capital: ${capital:.2f}, BTC: {position:.6f}")
+            print("Trade History:")
+            for trade in trades:
+                print(f"{trade['Date'].strftime('%Y-%m-%d %H:%M:%S.%f')}: {trade['Type']} {trade['BTC']:.6f} BTC at ${trade['Price']:.2f}, "
+                      f"Capital: ${trade['Capital']:.2f}, Position: {trade['Position']:.6f} BTC, "
+                      f"Latency: {trade['Latency']:.2f}ms, Volume: {trade['Volume']:.2f} BTC, Volatility: {trade['Volatility']:.2f}%, "
+                      f"Market: {trade['Market']}")
+
+# Run the bot
+if __name__ == "__main__":
+    main()
